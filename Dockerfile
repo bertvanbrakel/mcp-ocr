@@ -18,6 +18,9 @@ RUN apt-get update && \
 # This path might vary slightly depending on the base image/distro
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata
 
+# Expose the port Ktor will listen on
+EXPOSE 8080
+
 # Copy Gradle wrapper files
 COPY gradlew .
 COPY gradle gradle

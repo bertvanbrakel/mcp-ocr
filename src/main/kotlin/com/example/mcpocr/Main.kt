@@ -1,33 +1,41 @@
 package com.example.mcpocr
 
-import kotlinx.serialization.*
-import kotlinx.serialization.json.*
+// Core Kotlin/Java
 import java.io.File
 import java.awt.image.BufferedImage
 import javax.imageio.ImageIO
-import net.sourceforge.tess4j.*
-import org.apache.pdfbox.pdmodel.PDDocument // Keep existing import
-import org.apache.pdfbox.Loader // Import Loader for static load method
-import org.apache.pdfbox.rendering.PDFRenderer
+
+// Logging
 import org.slf4j.LoggerFactory
 
-// --- Data Classes for MCP Communication ---
+// Serialization
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.encodeToJsonElement
+import kotlinx.serialization.SerializationException // Import for specific exception handling
 
-@Serializable
-data class McpRequest(
-    val id: String,
-    val tool_name: String,
-    val arguments: JsonElement // Keep arguments flexible initially
-)
+// Coroutines
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-@Serializable
-data class McpResponse(
-    val id: String,
-    val result: JsonElement? = null,
-    val error: String? = null
-)
+// Ktor (Needed for Application, embeddedServer, Netty)
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.netty.*
 
-// --- Argument Data Classes ---
+// MCP Kotlin SDK
+import io.modelcontextprotocol.kotlin.sdk.*
+import io.modelcontextprotocol.kotlin.sdk.server.*
+import io.modelcontextprotocol.kotlin.sdk.datatypes.* // Includes Implementation, ServerCapabilities, ToolDefinition, ToolExecutionRequest, ToolResult, ToolError
+
+// Tesseract/PDFBox
+import net.sourceforge.tess4j.*
+import org.apache.pdfbox.Loader
+import org.apache.pdfbox.pdmodel.PDDocument
+import org.apache.pdfbox.rendering.PDFRenderer
+
+
+// --- Argument & Result Data Classes ---
 
 @Serializable
 data class ImageToTextArgs(
@@ -41,161 +49,236 @@ data class PdfToTextArgs(
     val language: String = "eng"
 )
 
+// Define a simple data class for the successful result payload
 @Serializable
-data class ToolResult(val text: String)
+data class OcrResult(val text: String)
 
-@Serializable
-data class ErrorResult(val message: String)
-
-// --- Main Application ---
+// --- Main Application & Ktor Setup ---
 
 private val logger = LoggerFactory.getLogger("McpOcrServer")
-private val json = Json { ignoreUnknownKeys = true; prettyPrint = true } // Lenient JSON parsing
+// Use the Json instance provided by the SDK for consistency
+private val json = Json { ignoreUnknownKeys = true; prettyPrint = true } // Or potentially MCP.JSON
 
 fun main() {
-    logger.info("MCP OCR Server starting...")
+    val port = 8080 // Consider making configurable
+    logger.info("Starting Ktor MCP OCR Server with SDK on port {}...", port)
+    // SDK handles server setup internally when using Ktor integration
+    embeddedServer(Netty, port = port, module = Application::module).start(wait = true)
+}
 
-    // Initialize Services
-    val tessDataPath = System.getenv("TESSDATA_PREFIX") ?: "/usr/share/tesseract-ocr/4.00/tessdata" // Sensible default for Debian/Ubuntu
+fun Application.module() {
+    // Initialize Services (Consider dependency injection for real apps)
+    val tessDataPath = environment.config.propertyOrNull("ocr.tessdata_prefix")?.getString()
+        ?: System.getenv("TESSDATA_PREFIX")
+        ?: "/usr/share/tesseract-ocr/4.00/tessdata" // Default for Debian/Ubuntu Tesseract 4
     logger.info("Using TESSDATA_PREFIX: {}", tessDataPath)
     val ocrService = OcrService(tessDataPath)
     val pdfProcessor = PdfProcessor()
 
-    try {
-        while (true) {
-            val line = readlnOrNull() ?: break // Read request line from stdin
-            logger.debug("Received raw request: {}", line)
+    // Configure MCP Server using SDK's Ktor extension
+    mcp { // Installs required Ktor plugins (SSE, ContentNegotiation) and sets up routing
+        Server(
+            serverInfo = Implementation(name = "mcp-ocr-server", version = "1.0.0"),
+            options = ServerOptions(
+                capabilities = ServerCapabilities(
+                    tools = ServerCapabilities.Tools(listChanged = null) // Indicate tool capability
+                )
+            )
+        ).apply {
+            // Define JSON Schemas (as strings)
+            val imageToTextInputSchema = """
+                {
+                  "type": "object",
+                  "properties": {
+                    "image_path": { "type": "string", "description": "Absolute path to the input image file." },
+                    "language": { "type": "string", "description": "Tesseract language code(s). Defaults to 'eng'.", "default": "eng" }
+                  },
+                  "required": ["image_path"]
+                }
+            """.trimIndent()
+            val pdfToTextInputSchema = """
+                {
+                  "type": "object",
+                  "properties": {
+                    "pdf_path": { "type": "string", "description": "Absolute path to the input PDF file." },
+                    "language": { "type": "string", "description": "Tesseract language code(s). Defaults to 'eng'.", "default": "eng" }
+                  },
+                  "required": ["pdf_path"]
+                }
+            """.trimIndent()
+             val ocrOutputSchema = """
+                {
+                  "type": "object",
+                  "properties": {
+                    "text": { "type": "string", "description": "The extracted text content." }
+                  },
+                   "required": ["text"]
+                }
+            """.trimIndent()
 
-            try {
-                val request = json.decodeFromString<McpRequest>(line)
-                logger.info("Processing request id: {}, tool: {}", request.id, request.tool_name)
+            // Add image_to_text tool
+            addTool(ToolDefinition(
+                name = "image_to_text",
+                description = "Extracts text from a given image file.",
+                inputSchema = Json.parseToJsonElement(imageToTextInputSchema),
+                outputSchema = Json.parseToJsonElement(ocrOutputSchema),
+                handler = { request -> handleImageToText(request, ocrService) } // Pass needed service
+            ))
 
-                val response = processRequest(request, ocrService, pdfProcessor)
-
-                val responseJson = json.encodeToString(response)
-                println(responseJson) // Write response JSON to stdout
-                logger.debug("Sent response: {}", responseJson)
-
-            } catch (e: SerializationException) {
-                logger.error("Failed to parse request JSON: {}", line, e)
-                // Respond with a generic error if possible, though requires request ID
-            } catch (e: Exception) {
-                logger.error("Unexpected error processing request: {}", line, e)
-                // Respond with a generic error if possible
-            }
+            // Add pdf_to_text tool
+            addTool(ToolDefinition(
+                name = "pdf_to_text",
+                description = "Extracts text from all pages of a given PDF file.",
+                inputSchema = Json.parseToJsonElement(pdfToTextInputSchema),
+                outputSchema = Json.parseToJsonElement(ocrOutputSchema),
+                handler = { request -> handlePdfToText(request, ocrService, pdfProcessor) } // Pass needed services
+            ))
         }
-    } catch (e: Exception) {
-        logger.error("Critical error in main loop", e)
-    } finally {
-        logger.info("MCP OCR Server shutting down.")
     }
 }
 
-fun processRequest(request: McpRequest, ocrService: OcrService, pdfProcessor: PdfProcessor): McpResponse {
+// --- Tool Handler Functions ---
+
+private suspend fun handleImageToText(
+    request: ToolExecutionRequest,
+    ocrService: OcrService
+): ToolResult {
     return try {
-        when (request.tool_name) {
-            "image_to_text" -> {
-                val args = json.decodeFromJsonElement<ImageToTextArgs>(request.arguments)
-                logger.info("Processing image_to_text for path: {}", args.image_path)
-                val imageFile = File(args.image_path)
-                if (!imageFile.exists()) throw IllegalArgumentException("Image file not found: ${args.image_path}")
-                val image = ImageIO.read(imageFile) // Explicitly read from File
-                    ?: throw IllegalArgumentException("Could not read image file: ${args.image_path}")
+        val args = request.argumentsAs<ImageToTextArgs>() // Use SDK extension function
+        logger.info("Executing image_to_text for path: {}", args.image_path)
 
-                ocrService.performOcr(image, args.language).fold(
-                    onSuccess = { text ->
-                        McpResponse(id = request.id, result = json.encodeToJsonElement(ToolResult(text))) // Use named arg
-                    },
-                    onFailure = { error ->
-                        McpResponse(id = request.id, error = "OCR failed: ${error.message}") // Use named arg
-                    }
-                )
-            }
-            "pdf_to_text" -> {
-                val args = json.decodeFromJsonElement<PdfToTextArgs>(request.arguments)
-                logger.info("Processing pdf_to_text for path: {}", args.pdf_path)
-                pdfProcessor.extractImagesFromPdf(args.pdf_path).fold(
-                    onSuccess = { images ->
-                        val combinedText = images.mapIndexedNotNull { index, image ->
-                            logger.debug("Performing OCR on page {} of {}", index + 1, images.size) // Corrected logging index
-                            ocrService.performOcr(image, args.language).getOrNull() // Get text or null on failure
-                        }.joinToString("\n\n--- Page Break ---\n\n") // Add separator between pages
-                        McpResponse(id = request.id, result = json.encodeToJsonElement(ToolResult(combinedText))) // Use named arg
-                    },
-                   onFailure = { pdfError -> // Explicitly name exception
-                        McpResponse(id = request.id, error = "PDF processing failed: ${pdfError.message}") // Use named arg
-                    }
-                )
-            }
-            else -> McpResponse(id = request.id, error = "Unknown tool: ${request.tool_name}") // Use named arg
+        val imageFile = File(args.image_path)
+        // Use Java NIO Files.exists for potentially better compatibility if basic File.exists fails
+        // if (!Files.exists(imageFile.toPath())) {
+        if (!imageFile.exists()) { // Revert to standard check first
+             throw IllegalArgumentException("Image file not found: ${args.image_path}")
         }
+
+        val image = withContext(Dispatchers.IO) {
+            ImageIO.read(imageFile) // Use standard ImageIO.read
+                ?: throw IllegalArgumentException("Could not read image file: ${args.image_path}")
+        }
+
+        // Run OCR in a background thread pool suitable for CPU-bound tasks
+        withContext(Dispatchers.Default) {
+            ocrService.performOcr(image, args.language)
+        }.fold(
+            onSuccess = { text -> ToolResult(result = json.encodeToJsonElement(OcrResult(text))) },
+            onFailure = { error -> ToolResult(error = ToolError(message = "OCR failed: ${error.message}")) }
+        )
     } catch (e: SerializationException) {
-        logger.error("Failed to parse arguments for tool {}: {}", request.tool_name, request.arguments, e)
-        McpResponse(id = request.id, error = "Invalid arguments for tool ${request.tool_name}: ${e.message}") // Use named arg
+        logger.error("Invalid arguments for image_to_text: {}", request.arguments, e)
+        ToolResult(error = ToolError(message = "Invalid arguments: ${e.message}"))
     } catch (e: IllegalArgumentException) {
-        logger.error("Invalid argument for tool {}: {}", request.tool_name, e.message)
-        McpResponse(id = request.id, error = "Invalid argument: ${e.message}") // Use named arg
+        logger.error("Invalid argument for image_to_text: {}", e.message)
+        ToolResult(error = ToolError(message = "Invalid argument: ${e.message}"))
     } catch (e: Exception) {
-        logger.error("Unexpected error processing tool {}: {}", request.tool_name, e.message, e)
-        McpResponse(id = request.id, error = "Internal server error: ${e.message}") // Use named arg
+        logger.error("Unexpected error in image_to_text", e)
+        ToolResult(error = ToolError(message = "Internal server error: ${e.message ?: e.javaClass.simpleName}"))
     }
 }
 
-// --- Placeholder Service Classes (Implement according to PLAN.llm.md) ---
+private suspend fun handlePdfToText(
+    request: ToolExecutionRequest,
+    ocrService: OcrService,
+    pdfProcessor: PdfProcessor
+): ToolResult {
+    return try {
+        val args = request.argumentsAs<PdfToTextArgs>() // Use SDK extension function
+        logger.info("Processing pdf_to_text for path: {}", args.pdf_path)
+
+        // Extract images (IO-bound)
+        val imagesResult = withContext(Dispatchers.IO) {
+            pdfProcessor.extractImagesFromPdf(args.pdf_path)
+        }
+
+        imagesResult.fold(
+            onSuccess = { images ->
+                // Perform OCR on each image (CPU-bound) and combine results
+                val pageResults = images.mapIndexed { index, image ->
+                     logger.debug("Performing OCR on page {} of {}", index + 1, images.size)
+                     withContext(Dispatchers.Default) {
+                         ocrService.performOcr(image, args.language)
+                     } // Result<String>
+                 }
+
+                // Combine successful results, report first error if any page failed
+                val errors = pageResults.mapNotNull { it.exceptionOrNull() }
+                if (errors.isNotEmpty()) {
+                     logger.error("OCR failed on one or more pages for PDF: {}", args.pdf_path)
+                     ToolResult(error = ToolError(message = "OCR failed on page(s): ${errors.first().message}"))
+                } else {
+                    val combinedText = pageResults.mapNotNull { it.getOrNull() }.joinToString("\n\n--- Page Break ---\n\n")
+                    ToolResult(result = json.encodeToJsonElement(OcrResult(combinedText)))
+                }
+            },
+            onFailure = { error ->
+                ToolResult(error = ToolError(message = "PDF processing failed: ${error.message}"))
+            }
+        )
+    } catch (e: SerializationException) {
+        logger.error("Invalid arguments for pdf_to_text: {}", request.arguments, e)
+        ToolResult(error = ToolError(message = "Invalid arguments: ${e.message}"))
+    } catch (e: IllegalArgumentException) {
+        logger.error("Invalid argument for pdf_to_text: {}", e.message)
+        ToolResult(error = ToolError(message = "Invalid argument: ${e.message}"))
+    } catch (e: Exception) {
+        logger.error("Unexpected error in pdf_to_text", e)
+        ToolResult(error = ToolError(message = "Internal server error: ${e.message ?: e.javaClass.simpleName}"))
+    }
+}
+
+
+// --- OCR and PDF Service Classes ---
 
 class OcrService(tessDataPath: String) {
     private val tesseract: ITesseract = Tesseract().apply {
         setDatapath(tessDataPath)
-        // Consider adding more configurations if needed (e.g., page seg mode)
         logger.info("Tesseract instance initialized with data path: {}", tessDataPath)
     }
 
+    // Note: Tesseract instance might not be thread-safe depending on version/usage.
+    // Consider synchronization or creating instances per request if needed.
     fun performOcr(image: BufferedImage, language: String = "eng"): Result<String> {
         logger.debug("Performing OCR with language: {}", language)
         return runCatching {
-            // Ensure thread safety if calling concurrently - Tesseract instance might not be thread-safe
-            // synchronized(tesseract) { // Example synchronization if needed
-                 tesseract.setLanguage(language)
-                 tesseract.doOCR(image)
-            // }
-        }.onSuccess { text -> // Explicitly name result
+            tesseract.setLanguage(language)
+            tesseract.doOCR(image)
+        }.onSuccess { text ->
              logger.debug("OCR successful, text length: {}", text.length)
-        }.onFailure { exception -> // Explicitly name exception
+        }.onFailure { exception ->
             logger.error("Tesseract OCR failed for language {}", language, exception)
         }
     }
 }
 
 class PdfProcessor {
-    // Consider making DPI configurable
-    private val renderDpi = 300f
+    private val renderDpi = 300f // Consider making configurable
 
     fun extractImagesFromPdf(pdfPath: String): Result<List<BufferedImage>> {
         logger.debug("Extracting images from PDF: {}", pdfPath)
         val pdfFile = File(pdfPath)
-        if (!pdfFile.exists()) {
+        if (!pdfFile.exists()) { // Standard File.exists()
              logger.error("PDF file not found: {}", pdfPath)
              return Result.failure(IllegalArgumentException("PDF file not found: $pdfPath"))
         }
 
         return runCatching {
-            Loader.loadPDF(pdfFile).use { document: PDDocument -> // Use static Loader.loadPDF and explicitly type document
+            Loader.loadPDF(pdfFile).use { document: PDDocument ->
                 if (document.isEncrypted) {
                     logger.warn("PDF is encrypted, attempting to process anyway: {}", pdfPath)
-                    // Optionally try to decrypt with empty password, or fail here
-                    // document.decrypt("") // Requires empty password or handling
+                    // Consider adding decryption logic if needed: document.decrypt("")
                 }
                 val renderer = PDFRenderer(document)
                 logger.debug("PDF has {} pages.", document.numberOfPages)
-                (0 until document.numberOfPages).map { pageIndex ->
+                List(document.numberOfPages) { pageIndex ->
                     logger.debug("Rendering page {} with DPI {}", pageIndex + 1, renderDpi)
-                    // This can be memory intensive for large PDFs / high DPI
                     renderer.renderImageWithDPI(pageIndex, renderDpi)
                 }
             }
-        }.onSuccess { imageList: List<BufferedImage> -> // Explicitly type lambda parameter
+        }.onSuccess { imageList: List<BufferedImage> ->
              logger.info("Successfully extracted {} images from PDF: {}", imageList.size, pdfPath)
-        }.onFailure { exception: Throwable -> // Explicitly type lambda parameter
+        }.onFailure { exception: Throwable ->
             logger.error("PDF processing failed for path: {}", pdfPath, exception)
         }
     }
